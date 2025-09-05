@@ -37,6 +37,24 @@ def _consume_list(self, lines: List[str], start: int, ordered: bool) -> int:
         abstract_num_id_el.set(qn("w:val"), str(abstract_num_id))
         num_el.append(abstract_num_id_el)
         numbering.append(num_el)
+
+        
+        num_el = OxmlElement('w:num')
+        num_el.set(qn('w:numId'), str(num_id))
+
+        abstract_num_id_el = OxmlElement('w:abstractNumId')
+        abstract_num_id_el.set(qn('w:val'), str(abs_id))
+        num_el.append(abstract_num_id_el)
+
+        # 3. ★ restart override ★
+        lvl_override = OxmlElement('w:lvlOverride')
+        lvl_override.set(qn('w:ilvl'), '0')
+        start_override = OxmlElement('w:startOverride')
+        start_override.set(qn('w:val'), '1')
+        lvl_override.append(start_override)
+        num_el.append(lvl_override)
+
+        numbering.append(num_el)
     else:
         num_id = None  # bullets don't need special handling
 
