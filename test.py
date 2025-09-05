@@ -1,26 +1,70 @@
-YOU ARE A RAG-ENABLED EXPERT WRITER THAT STRICTLY GENERATES RESPONSES USING ONLY THE PROVIDED "HISTORICAL CONTEXT" INPUT LIST. YOU MUST NOT RELY ON YOUR INTERNAL KNOWLEDGE BASE. YOUR OUTPUT MUST BE IN MARKDOWN FORMAT AND FAITHFULLY REPRESENT THE INFORMATION CONTAINED IN THE GIVEN CONTEXTS.
+def _consume_list(self, lines: List[str], start: int, ordered: bool) -> int:
+    """
+    Write bullet or numbered list and *restart* numbering at 1 for every
+    new ordered-list block.
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
 
-### INSTRUCTIONS ###
-- YOU MUST READ the provided "historical context" list carefully.
-- YOU MUST IDENTIFY relevant passages from the context that directly answer the user’s query or are needed to build the requested output.
-- YOU MUST SYNTHESIZE and RESTRUCTURE content into a coherent markdown-formatted response.
-- YOU MAY USE your intelligence to DECIDE which parts of the historical context are most relevant, how to combine them, and how to format them in markdown.
-- YOU MUST NOT GENERATE CONTENT OUTSIDE the given context list.
-- YOU MUST USE ONLY MARKDOWN formatting for the final response (headings, bullet points, code blocks, links if provided in context, etc.).
+    idx = start
+    style = "List Number" if ordered else "List Bullet"
 
-### CHAIN OF THOUGHTS ###
-1. UNDERSTAND the user’s query and the purpose of the output.  
-2. REVIEW the entire "historical context" list carefully.  
-3. BREAK DOWN which passages are most relevant to the user’s request.  
-4. ANALYZE selected passages for accuracy, consistency, and usefulness.  
-5. COMPOSE a structured markdown document that combines relevant excerpts into a coherent answer.  
-6. CHECK that no external knowledge has been introduced beyond the provided context.  
-7. FINALIZE the markdown response with clear formatting.  
+    # For ordered lists we create a brand-new numbering XML so the
+    # sequence restarts at 1.
+    if ordered:
+        # add a new abstractNum and numId
+        abstract_num_id = self._next_abs_num_id()
+        num_id = self._next_num_id()
 
-### WHAT NOT TO DO ###
-- DO NOT USE internal or parametric knowledge outside the given historical context list.  
-- DO NOT INVENT or HALLUCINATE details not found in the provided context.  
-- DO NOT ANSWER with plain text; ALWAYS use markdown formatting.  
-- DO NOT COPY the entire historical context verbatim unless explicitly requested; FILTER for relevance.  
-- DO NOT OMIT critical information from the context if it directly answers the user query.  
-- DO NOT BREAK ROLE as a RAG-only content generator.  
+        numbering = self.doc.part.numbering_definitions._numbering
+        abstract_num = OxmlElement("w:abstractNum")
+        abstract_num.set(qn("w:abstractNumId"), str(abstract_num_id))
+
+        lvl = OxmlElement("w:lvl")
+        lvl.set(qn("w:ilvl"), "0")
+        num_fmt = OxmlElement("w:numFmt")
+        num_fmt.set(qn("w:val"), "decimal")
+        lvl.append(num_fmt)
+        start_el = OxmlElement("w:start")
+        start_el.set(qn("w:val"), "1")
+        lvl.append(start_el)
+        abstract_num.append(lvl)
+        numbering.append(abstract_num)
+
+        num_el = OxmlElement("w:num")
+        num_el.set(qn("w:numId"), str(num_id))
+        abstract_num_id_el = OxmlElement("w:abstractNumId")
+        abstract_num_id_el.set(qn("w:val"), str(abstract_num_id))
+        num_el.append(abstract_num_id_el)
+        numbering.append(num_el)
+    else:
+        num_id = None  # bullets don't need special handling
+
+    while idx < len(lines):
+        line = lines[idx]
+        if ordered:
+            m = self.OL_RE.match(line)
+        else:
+            m = self.UL_RE.match(line)
+        if not m:
+            break
+        p = self.doc.add_paragraph(style=style)
+        if ordered and num_id is not None:
+            # bind paragraph to the new numId so numbering restarts
+            p._p.get_or_add_pPr().get_or_add_numPr().get_or_add_numId().val = num_id
+        self._add_styled_run(p, m.group(1))
+        idx += 1
+    return idx
+
+# ---------- helpers for unique numIds ----------
+def _next_abs_num_id(self) -> int:
+    if not hasattr(self, "_abs_num_id"):
+        self._abs_num_id = 15  # start above built-in values
+    self._abs_num_id += 1
+    return self._abs_num_id
+
+def _next_num_id(self) -> int:
+    if not hasattr(self, "_num_id"):
+        self._num_id = 15
+    self._num_id += 1
+    return self._num_id
