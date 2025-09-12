@@ -1,230 +1,201 @@
+#!/usr/bin/env python3
+"""
+Async synthetic-data generator – ready to run.
+Requires:  pip install openai>=1.0 aiohttp
+"""
+
 import asyncio
 import json
 import re
 import math
+import os
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
-import aiohttp
-from aiohttp import ClientSession
+
+from openai import AsyncOpenAI          # official async client
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("data-gen")
 
+# ------------------------------------------------------------------
+# JSON repair helper
+# ------------------------------------------------------------------
+def json_fix(json_str: str) -> Optional[List[Dict[str, Any]]]:
+    """Fix trailing commas and unbalanced braces / brackets."""
+    try:
+        clean = re.sub(r",\s*([}\]])", r"\1", json_str)
+        open_b  = clean.count("{")
+        close_b = clean.count("}")
+        if open_b > close_b:
+            clean += "}" * (open_b - close_b)
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return None
+
+# ------------------------------------------------------------------
+# Core async generator class
+# ------------------------------------------------------------------
 class AsyncDataGenerator:
-    def __init__(self, deployment_name: str, max_concurrent: int = 10):
-        self.deployment_name = deployment_name
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.session: Optional[ClientSession] = None
-        
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=100, limit_per_host=30),
-            timeout=aiohttp.ClientTimeout(total=30)
+    def __init__(
+        self,
+        deployment_name: str,
+        api_version: str = "2023-12-01-preview",
+        max_concurrent: int = 15,
+    ):
+        self.deployment = deployment_name
+        self.api_ver    = api_version
+        self.semaphore  = asyncio.Semaphore(max_concurrent)
+
+        # ---- reusable async OpenAI client ----
+        self.client = AsyncOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version=api_version,
         )
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
 
-    def json_fix(self, json_str: str) -> Optional[List[Dict]]:
-        """Fix common JSON formatting issues"""
-        try:
-            # Remove trailing commas
-            clean = re.sub(r',\s*([}\]])', r'\1', json_str)
-            
-            # Balance braces
-            open_braces = clean.count('{')
-            closed_braces = clean.count('}')
-            if open_braces > closed_braces:
-                clean += '}' * (open_braces - closed_braces)
-            
-            return json.loads(clean)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse JSON, attempting with quotes")
-            try:
-                return json.loads(f'"{clean}"')
-            except Exception as e:
-                logger.error(f"JSON fix failed: {e}")
-                return None
+    # ------------- internal API caller ------------------------------
+    async def _call_openai_api(self, system: str, user: str) -> Dict[str, str]:
+        """Return dict with .get('content') – never None."""
+        async with self.semaphore:
+            resp = await self.client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.7,
+                model=self.deployment,
+            )
+            return {"content": resp.choices[0].message.content or ""}
 
+    # ------------- single chunk generator ---------------------------
     async def generate_chunk_records(
-        self, 
-        columns_chunk: List[Dict], 
+        self,
+        columns_chunk: List[Dict[str, Any]],
         num_records: int,
-        max_retries: int = 3
-    ) -> List[Dict]:
-        """Generate records for a chunk of columns with retry logic"""
-        
-        system_msg = """You are a data generation specialist. Generate synthetic data in valid JSON format only.
-            CRITICAL REQUIREMENTS:
-            1. Return ONLY a JSON array of records
-            2. Each record must be a valid JSON object
-            3. No explanatory text before or after the JSON
-            4. Ensure all JSON syntax is valid (no trailing commas, proper quotes)
-            5. All names must match exactly as specified
-            6. Skip generation for reference table columns
-            7. Values should be unique across records
-            8. Every value should be a string, not an integer
-            """
-        
-        user_msg = f"""Generate exactly {num_records} rows of synthetic data based on this column schema:
-            {columns_chunk}
-            
-            If categories are mentioned generate from those categories only.
-            
-            RESPONSE FORMAT:
-            [
-            {{"Column Name 1": "Value1", "Column Name 2": "Value2"}},
-            {{"Column Name 3": "Value3", "Column Name 4": "Value4"}}
-            ]
-            
-            Generate ONLY the JSON array, no other text.
-            """
-        
-        async with self.semaphore:  # Limit concurrent requests
-            for attempt in range(max_retries):
-                try:
-                    # Your actual API call here - replace with your client
-                    response = await self._call_openai_api(system_msg, user_msg)
-                    
-                    # Clean response
-                    content = response.get('content', '')
-                    if content.startswith("```json"):
-                        content = content[7:].strip("`\n")
-                    elif content.startswith("```"):
-                        content = content[3:].strip("`\n")
-                    
-                    rows = self.json_fix(content)
-                    if rows and len(rows) == num_records:
-                        return rows
-                        
-                    logger.warning(f"Attempt {attempt + 1}: Got {len(rows) if rows else 0} rows, expected {num_records}")
-                    
-                except Exception as e:
-                    logger.error(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt == max_retries - 1:
-                        raise
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-        
+        max_retries: int = 3,
+    ) -> List[Dict[str, Any]]:
+        system_msg = (
+            "You are a data-generation specialist. "
+            "Return ONLY a valid JSON array of objects. "
+            "No explanatory text. "
+            "All values must be strings. "
+            "Column names must appear exactly as given. "
+            "Do not repeat values within the block."
+        )
+
+        user_msg = (
+            f"Generate exactly {num_records} rows for:\n{columns_chunk}\n\n"
+            f'Format:  [{{"col":"val", ...}}, ...]'
+        )
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                raw = await self._call_openai_api(system_msg, user_msg)
+                content = raw.get("content", "")
+                # unwrap possible markdown
+                if content.startswith("```json"):
+                    content = content[7:].strip("`\n")
+                elif content.startswith("```"):
+                    content = content[3:].strip("`\n")
+
+                rows = json_fix(content)
+                if rows and len(rows) == num_records:
+                    return rows
+                logger.warning(
+                    "Attempt %s – got %s rows, wanted %s", attempt, len(rows or []), num_records
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Attempt %s failed: %s", attempt, exc)
+                if attempt == max_retries:
+                    raise
+                await asyncio.sleep(2 ** attempt)
         return []
 
-    async def _call_openai_api(self, system_msg: str, user_msg: str) -> Dict:
-        """Replace this with your actual OpenAI API call"""
-        # This is a placeholder - implement your actual API call
-        # For example, using aiohttp or your async OpenAI client
-        pass
+# ------------------------------------------------------------------
+# utilities
+# ------------------------------------------------------------------
+def chunk_columns(columns: List[Dict[str, Any]], chunk_size: int) -> List[List[Dict[str, Any]]]:
+    return [columns[i : i + chunk_size] for i in range(0, len(columns), chunk_size)]
 
-def chunk_columns(columns: List[Dict], chunk_size: int) -> List[List[Dict]]:
-    """Split columns into chunks"""
-    return [columns[i:i + chunk_size] for i in range(0, len(columns), chunk_size)]
-
+# ------------------------------------------------------------------
+# high-level orchestrator
+# ------------------------------------------------------------------
 async def generate_all_records_async(
-    column_details: List[Dict], 
-    num_records: int, 
+    column_details: List[Dict[str, Any]],
+    num_records: int,
     col_batch_size: int = 5,
-    rows_batch_size: int = 10,
-    max_concurrent: int = 10
-) -> Dict[str, List]:
-    """Main async generator function"""
-    
-    columns = defaultdict(list)
+    rows_batch_size: int = 50,
+    max_concurrent: int = 15,
+) -> Dict[str, List[str]]:
     col_names = {c["name"] for c in column_details}
-    
-    async with AsyncDataGenerator("your-deployment-name", max_concurrent) as generator:
-        
-        # Process columns in batches
-        schema_chunks = chunk_columns(column_details, col_batch_size)
-        
-        for chunk_idx, schema_chunk in enumerate(schema_chunks, 1):
-            logger.info(f"Processing schema batch {chunk_idx}/{len(schema_chunks)}")
-            
-            while True:
-                # Determine which columns still need data
-                needed = [c for c in schema_chunk if len(columns[c["name"]]) < num_records]
-                if not needed:
-                    break
-                
-                # Calculate how many more records we need
-                min_remaining = min(num_records - len(columns[s["name"]]) for s in needed)
-                effective_batch_size = min(rows_batch_size, min_remaining)
-                
-                # Create tasks for parallel generation
-                tasks = []
-                num_tasks = min(
-                    max_concurrent,
-                    math.ceil(min_remaining / effective_batch_size)
-                )
-                
-                for _ in range(num_tasks):
-                    task = generator.generate_chunk_records(needed, effective_batch_size)
-                    tasks.append(task)
-                
-                # Execute tasks concurrently
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Process results
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.error(f"Task failed: {result}")
-                        continue
-                        
-                    if not result:
-                        logger.warning("Empty result from generator")
-                        continue
-                    
-                    # Add generated data to columns
-                    for row in result:
-                        present_cols = set(row.keys())
-                        expected_cols = {s["name"] for s in needed}
-                        
-                        # Validate columns
-                        missing_cols = expected_cols - present_cols
-                        extra_cols = present_cols - col_names
-                        
-                        if missing_cols:
-                            logger.warning(f"Missing columns in row: {missing_cols}")
-                        
-                        if extra_cols:
-                            logger.warning(f"Extra columns in row: {extra_cols}")
-                        
-                        # Add valid data
-                        for col in needed:
-                            col_name = col["name"]
-                            if col_name in row:
-                                columns[col_name].append(row[col_name])
-                
-                # Log progress
-                progress = {c["name"]: len(columns[c["name"]]) for c in needed}
-                logger.info(f"Progress: {progress}")
-    
+    columns   = defaultdict(list)
+
+    gen = AsyncDataGenerator(
+        deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
+        max_concurrent=max_concurrent,
+    )
+
+    schema_chunks = chunk_columns(column_details, col_batch_size)
+
+    for chunk_idx, schema_chunk in enumerate(schema_chunks, 1):
+        logger.info("Schema chunk %s/%s", chunk_idx, len(schema_chunks))
+
+        while True:
+            needed = [c for c in schema_chunk if len(columns[c["name"]]) < num_records]
+            if not needed:
+                break
+
+            min_remaining = min(num_records - len(columns[s["name"]]) for s in needed)
+            effective_rows = min(rows_batch_size, min_remaining)
+            num_tasks = min(
+                max_concurrent, math.ceil(min_remaining / effective_rows)
+            )
+
+            tasks = [
+                gen.generate_chunk_records(needed, effective_rows) for _ in range(num_tasks)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.error("Task raised %s", res)
+                    continue
+                for row in res or []:
+                    for col in needed:
+                        name = col["name"]
+                        if name in row:
+                            columns[name].append(row[name])
+
+            logger.info(
+                "Progress: %s",
+                {c["name"]: len(columns[c["name"]]) for c in needed},
+            )
+
     return dict(columns)
 
-# Usage example
+# ------------------------------------------------------------------
+# quick demo / CLI
+# ------------------------------------------------------------------
 async def main():
-    column_details = [
+    cols = [
         {"name": "employee_id", "type": "string"},
         {"name": "employee_name", "type": "string"},
-        {"name": "department", "type": "string", "categories": ["HR", "Engineering", "Sales"]}
+        {"name": "department", "type": "string", "categories": ["HR", "Engineering", "Sales"]},
     ]
-    
-    try:
-        result = await generate_all_records_async(
-            column_details=column_details,
-            num_records=1000,
-            col_batch_size=3,
-            rows_batch_size=50,
-            max_concurrent=15
-        )
-        
-        print(f"Generated data for {len(result)} columns")
-        for col_name, values in result.items():
-            print(f"{col_name}: {len(values)} records")
-            
-    except Exception as e:
-        logger.error(f"Generation failed: {e}")
+
+    data = await generate_all_records_async(
+        column_details=cols,
+        num_records=200,
+        col_batch_size=3,
+        rows_batch_size=40,
+        max_concurrent=10,
+    )
+
+    for name, values in data.items():
+        print(f"{name}: {len(values)} records")
+    print("First row:", {k: v[0] for k, v in data.items()})
+
 
 if __name__ == "__main__":
     asyncio.run(main())
