@@ -1,88 +1,110 @@
-def _consume_list(self, lines: List[str], start: int, ordered: bool) -> int:
-    """
-    Write bullet or numbered list and *restart* numbering at 1 for every
-    new ordered-list block.
-    """
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
+async def json_fix(json_str):
+    clean = re.sub(r',\s*([}\]])', r'\1', json_str)
+    open_braces = clean.count('{')
+    closed_braces = clean.count('}')
+    if open_braces > closed_braces:
+        clean += '}' * (open_braces - closed_braces)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        try:
+            clean = f'"""{clean}"""'
+            return json.loads(clean)
+        except Exception as e:
+            return None
+    
+async def generate_chunk_records(columns_chunk, num_records):    
+    thread = threading.current_thread().name
+    # print(f"Thread {thread} starting generation: {len(columns_chunk)} col x {num_records} rows")
+    system_msg = """You are a data generation specialist. Generate synthetic data in valid JSON format only.
+        CRITICAL REQUIREMENTS:
+        1. Return ONLY a JSON array of records
+        2. Each record must be a valid JSON object
+        3. No explanatory text before or after the JSON
+        4. Ensure all JSON syntax is valid (no trailing commas, proper quotes)
+        5. All names must match exactly as specified no changes in the name is required.
+        6. Skip generation for reference table columns
+        7. REPSONSE FORMAT is for guidance do not generate the response format itself.
+        Important Note: The values should not be same in any two blocks of the json. The Names getting generated from the should be unique. No two different employee id should have same employee name.
+        """
+    user_msg = f"""Generate exactly {num_records} rows of synthetic data based on this column schema:
+        {columns_chunk}.
+        Here, the name key is the name of the column parameter is description and other fields explain themselves.
+        Do not change the name of the column keep it exactly same.
 
-    idx = start
-    style = "List Number" if ordered else "List Bullet"
+        If categories are mentioned generate from those categories only.
 
-    # For ordered lists we create a brand-new numbering XML so the
-    # sequence restarts at 1.
-    if ordered:
-        # add a new abstractNum and numId
-        abstract_num_id = self._next_abs_num_id()
-        num_id = self._next_num_id()
+        RESPONSE FORMAT:
+        [
+        {{"Column Name 1": "It's Value1", "Column Name 2": "It's Value2"}},
+        {{"Column Name 3": "It's Value3", "Column Name 4": "It's Value4"}}
+        ]
 
-        numbering = self.doc.part.numbering_definitions._numbering
-        abstract_num = OxmlElement("w:abstractNum")
-        abstract_num.set(qn("w:abstractNumId"), str(abstract_num_id))
+        Do not give response format as output give the output using the configuration.
+        Every value should be a string. Not an integer.
+        Generate ONLY the JSON array, no other text.
+        """
+    resp = await async_chat_client.chat.completions.create(messages=[
+            {
+                "role": "system",
+                "content": system_msg,
+            },
+            {
+                "role": "user",
+                "content": user_msg,
+            }
+        ],
+        temperature=0.7,
+        model=AZURE_OPENAI_DEPLOYMENT_NAME,
+        )
+    content = resp.choices[0].message.content
 
-        lvl = OxmlElement("w:lvl")
-        lvl.set(qn("w:ilvl"), "0")
-        num_fmt = OxmlElement("w:numFmt")
-        num_fmt.set(qn("w:val"), "decimal")
-        lvl.append(num_fmt)
-        start_el = OxmlElement("w:start")
-        start_el.set(qn("w:val"), "1")
-        lvl.append(start_el)
-        abstract_num.append(lvl)
-        numbering.append(abstract_num)
+    if content.startswith("```json"):
+        content = content[7:].strip("`\n")
+    elif content.startswith("```"):
+        content = content[3:].strip("`\n")
+    # rows = json.loads(content)
+    rows = json_fix(content)
+    return rows
 
-        num_el = OxmlElement("w:num")
-        num_el.set(qn("w:numId"), str(num_id))
-        abstract_num_id_el = OxmlElement("w:abstractNumId")
-        abstract_num_id_el.set(qn("w:val"), str(abstract_num_id))
-        num_el.append(abstract_num_id_el)
-        numbering.append(num_el)
 
-        
-        num_el = OxmlElement('w:num')
-        num_el.set(qn('w:numId'), str(num_id))
+def chunk_columns(columns, chunk_size):
+    batches = []
+    for i in range(0, len(columns), chunk_size):
+        batches.append(columns[i:i + chunk_size])
+    return batches 
 
-        abstract_num_id_el = OxmlElement('w:abstractNumId')
-        abstract_num_id_el.set(qn('w:val'), str(abs_id))
-        num_el.append(abstract_num_id_el)
-
-        # 3. ★ restart override ★
-        lvl_override = OxmlElement('w:lvlOverride')
-        lvl_override.set(qn('w:ilvl'), '0')
-        start_override = OxmlElement('w:startOverride')
-        start_override.set(qn('w:val'), '1')
-        lvl_override.append(start_override)
-        num_el.append(lvl_override)
-
-        numbering.append(num_el)
-    else:
-        num_id = None  # bullets don't need special handling
-
-    while idx < len(lines):
-        line = lines[idx]
-        if ordered:
-            m = self.OL_RE.match(line)
-        else:
-            m = self.UL_RE.match(line)
-        if not m:
-            break
-        p = self.doc.add_paragraph(style=style)
-        if ordered and num_id is not None:
-            # bind paragraph to the new numId so numbering restarts
-            p._p.get_or_add_pPr().get_or_add_numPr().get_or_add_numId().val = num_id
-        self._add_styled_run(p, m.group(1))
-        idx += 1
-    return idx
-
-# ---------- helpers for unique numIds ----------
-def _next_abs_num_id(self) -> int:
-    if not hasattr(self, "_abs_num_id"):
-        self._abs_num_id = 15  # start above built-in values
-    self._abs_num_id += 1
-    return self._abs_num_id
-
-def _next_num_id(self) -> int:
-    if not hasattr(self, "_num_id"):
-        self._num_id = 15
-    self._num_id += 1
-    return self._num_id
+async def generate_all_records_async(column_details, num_records, col_batch_size, rows_batch_size, generator_fn):
+    columns = defaultdict(list)
+    col_names = {c["name"] for c in column_details}
+    schema_chunk_list = chunk_columns(column_details, col_batch_size)
+    i = 1
+    for schema_chunk in schema_chunk_list:
+        print(f"PROCESSING SCHEMA BATCH {i}")
+        while True:
+            needed = [c for c in schema_chunk if len(columns[c["name"]]) < num_records]
+            if not needed:
+                break
+            min_remaining = min(num_records - len(columns[s["name"]]) for s in needed)
+            effective_row_batch = min(rows_batch_size, min_remaining)
+            max_workers = 20
+            if min_remaining < max_workers * rows_batch_size:
+                max_workers = math.ceil(min_remaining / rows_batch_size)
+            # Launch async tasks instead of threads
+            tasks = [generator_fn(needed, effective_row_batch) for _ in range(max_workers)]
+            results = await asyncio.gather(*tasks)
+            for rows in results:
+                if not rows:
+                    print("Warning LLM returned zero rows. Retrying....")
+                    continue
+                for idx, row in enumerate(rows, start=1):
+                    present = set(row.keys())
+                    missing = {s["name"] for s in needed} - present
+                    extra = present - set(col_names)
+                    for s in needed:
+                        name = s["name"]
+                        if name in row:
+                            columns[name].append(row[name])
+            print("Progress:", {c["name"]: len(columns[c["name"]]) for c in needed})
+        i += 1
+    return columns
