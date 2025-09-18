@@ -33,7 +33,7 @@ class GenerateSyntheticData:
             "Every value should be a string. Not an integer.\n"
             "Generate ONLY the JSON array, no other text."
         )
-        start = time.time()
+        start = time.perf_counter()
         resp = await async_chat_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": self.SYSTEM_MSG},
@@ -42,37 +42,39 @@ class GenerateSyntheticData:
             temperature=0.6,
             model=AZURE_OPENAI_DEPLOYMENT_NAME,
         )
-        elapsed = time.time() - start
-        print(f"Requested {num_records}, batch generated in {elapsed:.2f} seconds")
+        elapsed = time.perf_counter() - start
+
         content = resp.choices[0].message.content.strip()
         if content.startswith("```"):
             content = content.strip('`')
             if content.lower().startswith("json"):
                 content = content[4:]
             content = content.strip().lstrip('\n')
-        data = json.loads(content)
-        # data should be a list of records (JSON objects)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"[Error] Failed to parse JSON for batch requested={num_records}: {e}")
+            data = []
+
+        generated = len(data)
+        print(f"[Batch] Requested {num_records} records, Generated {generated} records, Time taken {elapsed:.2f} seconds")
+
         return data
 
     async def generate_all(self, schema):
-        """
-        Generates TOTAL_RECORDS records, compensating for under-delivery by
-        spawning additional batch tasks as needed.
-        """
         total_needed = self.TOTAL_RECORDS
         batch_size = self.ROW_BATCH_SIZE
         concurrency = self.CONCURRENCY
 
-        results = []
+        overall_start = time.perf_counter()
+
         semaphore = asyncio.Semaphore(concurrency)
 
         async def sem_generate(n):
             async with semaphore:
-                batch = await self.generate_batch(n, schema)
-                return batch
+                return await self.generate_batch(n, schema)
 
-        # We will maintain a queue of "jobs" (how many records to request in a batch).
-        # Initially, break into chunks of batch_size, with one possibly smaller.
+        # prepare initial batch requests
         to_request = []
         num_full = total_needed // batch_size
         rem = total_needed % batch_size
@@ -81,50 +83,45 @@ class GenerateSyntheticData:
         if rem:
             to_request.append(rem)
 
-        # We'll keep issuing jobs until we accumulate enough records.
-        tasks = []
+        pending = set()
         for req in to_request:
-            tasks.append(asyncio.create_task(sem_generate(req)))
+            task = asyncio.create_task(sem_generate(req))
+            pending.add(task)
 
-        # As batches finish, check if we have any shortfall
-        # If shortfall, issue more batch tasks for missing count
-        completed = 0
+        completed_count = 0
         results = []
-        # Use a set or list to track the pending tasks
-        pending = set(tasks)
-        # We'll loop until we have enough data
+
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 try:
                     batch = task.result()
                 except Exception as e:
-                    # Handle error — optionally retry or log
-                    print(f"Error generating batch: {e}")
+                    print(f"[Error] Batch task raised exception: {e}")
                     batch = []
+                generated = len(batch)
                 results.extend(batch)
-                completed += len(batch)
+                completed_count += generated
+                # You could also print here how many were *requested* by this task.
+                # But that info comes via the batch log above.
 
-            # Now see if we still need more records
-            if completed < total_needed:
-                still_needed = total_needed - completed
-                # We want to request in batch_size chunks if possible, else the remainder
+            if completed_count < total_needed:
+                still_needed = total_needed - completed_count
                 next_batch_size = batch_size if still_needed >= batch_size else still_needed
-                # Spawn a new task
                 new_task = asyncio.create_task(sem_generate(next_batch_size))
                 pending.add(new_task)
-            # If completed >= total_needed, we can cancel/ignore remaining tasks
-            if completed >= total_needed:
-                # cancel pending tasks to free up resources
+
+            if completed_count >= total_needed:
                 for t in pending:
                     t.cancel()
                 break
 
-        # Optionally, you might want to gather/catch cancellation exceptions
-        # Flatten and truncate to exactly total_needed
         final = results[:total_needed]
         if len(final) != total_needed:
-            raise RuntimeError(f"Expected {total_needed} records, but got {len(final)} even after compensation")
+            raise RuntimeError(f"Expected {total_needed} records, but got {len(final)} even after compensations")
+
+        overall_elapsed = time.perf_counter() - overall_start
+        print(f"[Overall] Requested {total_needed}, Generated {len(final)} records in {overall_elapsed:.2f} seconds")
 
         return final
 
@@ -152,10 +149,7 @@ async def main():
     ]
     generator = GenerateSyntheticData(TOTAL_RECORDS)
     data = await generator.generate_all(schema)
-    # Now data has exactly TOTAL_RECORDS objects
-    # e.g. write to file or DB:
-    # with open("synthetic_data.json", "w") as f:
-    #     json.dump(data, f)
+    # e.g. save/output data
 
 if __name__ == "__main__":
     asyncio.run(main())
