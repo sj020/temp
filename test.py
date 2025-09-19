@@ -2,15 +2,12 @@ import asyncio
 import time
 import json
 
-# Assuming async_chat_client etc. are available in scope
-# Replace AZURE_OPENAI_DEPLOYMENT_NAME with your actual deployment/model
-
 class GenerateSyntheticData:
     def __init__(self, TOTAL_RECORDS):
         self.TOTAL_RECORDS = TOTAL_RECORDS
         self.ROW_BATCH_SIZE = 20
-        self.COLUMN_BATCH_SIZE = 10  # tune this based on context size
-        self.CONCURRENCY = 5         # tune to avoid rate limits / overloading
+        self.COLUMN_BATCH_SIZE = 30
+        self.CONCURRENCY = 5  # tune as needed
         self.SYSTEM_MSG = (
             "You are a data generation specialist. Generate synthetic data in valid JSON format only.\n"
             "CRITICAL REQUIREMENTS:\n"
@@ -28,8 +25,9 @@ class GenerateSyntheticData:
         for i in range(0, len(schema), self.COLUMN_BATCH_SIZE):
             yield schema[i:i + self.COLUMN_BATCH_SIZE]
 
-    async def generate_batch(self, num_records, schema_subset):
-        """Generate num_records rows for only schema_subset columns."""
+    async def generate_batch(self, num_records, schema_subset, schema_chunk_idx, row_batch_idx):
+        """Generate num_records rows for only schema_subset columns, with batch tracking."""
+        col_names = [col['name'] for col in schema_subset]
         USER_MSG = (
             f"Generate exactly {num_records} rows using ONLY these columns:\n{schema_subset}\n\n"
             "Output ONLY a JSON array. Every row must include *all* these columns. "
@@ -56,75 +54,77 @@ class GenerateSyntheticData:
         try:
             data = json.loads(content)
         except json.JSONDecodeError as e:
-            print(f"[Error] JSON parse error for schema cols={len(schema_subset)}, requested {num_records}: {e}")
+            print(f"[Error] [SchemaChunk {schema_chunk_idx}] RowBatch {row_batch_idx}: JSON parse error for {num_records} rows, cols {len(col_names)}: {e}")
             data = []
 
         generated = len(data)
-        print(f"[Batch] schema_cols={len(schema_subset)} ‒ Requested {num_records}, Got {generated}, Time {elapsed:.2f}s")
+        print(f"[Batch] [SchemaChunk {schema_chunk_idx}] Columns {col_names[:2]}...({len(col_names)} cols)... RowBatch {row_batch_idx}: Requested {num_records}, Got {generated}, Time {elapsed:.2f}s")
         return data
 
-    async def _generate_for_schema_chunk(self, schema_subset):
+    async def _generate_for_schema_chunk(self, schema_subset, schema_chunk_idx):
         """
         For a given schema subset (columns), produce exactly TOTAL_RECORDS rows (dicts),
         each having all the columns in schema_subset, retrying missing rows/columns if needed.
+        Tracking each row batch with indices.
         """
         total_needed = self.TOTAL_RECORDS
-        batch = self.ROW_BATCH_SIZE
+        batch_size = self.ROW_BATCH_SIZE
         concurrency = self.CONCURRENCY
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def sem_generate(n):
+        async def sem_generate(n, row_batch_idx):
             async with semaphore:
-                return await self.generate_batch(n, schema_subset)
+                return await self.generate_batch(n, schema_subset, schema_chunk_idx, row_batch_idx)
 
-        # Plan initial row‐batches
-        to_request = [batch] * (total_needed // batch)
-        if total_needed % batch:
-            to_request.append(total_needed % batch)
-
-        collected = []  # list of row dicts for this schema chunk
+        # Plan initial row-batches
+        num_full_batches = total_needed // batch_size
+        rem = total_needed % batch_size
+        to_request = []
+        for i in range(num_full_batches):
+            to_request.append((batch_size, i + 1))  # (rows, batch_idx)
+        if rem:
+            to_request.append((rem, num_full_batches + 1))
 
         # Launch all initial row batch tasks
-        initial_tasks = [asyncio.create_task(sem_generate(rq)) for rq in to_request]
+        tasks = []
+        for (rq, batch_idx) in to_request:
+            tasks.append(asyncio.create_task(sem_generate(rq, batch_idx)))
 
-        # Collect results as tasks complete
-        for task in asyncio.as_completed(initial_tasks):
+        collected = []
+        # As rows come in
+        for task in asyncio.as_completed(tasks):
             try:
                 batch_data = await task
             except Exception as e:
-                print(f"[Error] row batch task failed: {e}")
+                print(f"[Error] [SchemaChunk {schema_chunk_idx}] A row batch task failed: {e}")
                 batch_data = []
             collected.extend(batch_data)
 
         # If we got fewer than needed rows, request more
+        extra_batch_idx = len(to_request) + 1
         while len(collected) < total_needed:
             still = total_needed - len(collected)
-            next_batch_size = min(batch, still)
-            print(f"[Info] schema_cols={len(schema_subset)}: need {still} more rows → requesting {next_batch_size} more.")
-            extra = await self.generate_batch(next_batch_size, schema_subset)
+            next_batch_size = min(batch_size, still)
+            print(f"[Info] [SchemaChunk {schema_chunk_idx}] initial collected {len(collected)} < {total_needed}, requesting extra batch {extra_batch_idx} with {next_batch_size} rows")
+            extra = await self.generate_batch(next_batch_size, schema_subset, schema_chunk_idx, extra_batch_idx)
             collected.extend(extra)
+            extra_batch_idx += 1
 
         # Trim to total_needed
         collected = collected[:total_needed]
 
-        # Validate each row has all columns; if a row misses some columns, try to fix it
+        # Validate missing columns per row and repair if needed
         for idx, row in enumerate(collected):
             missing_cols = [col['name'] for col in schema_subset if col['name'] not in row]
             if missing_cols:
-                print(f"[Warning] Row index {idx} missing columns {missing_cols} in schema chunk cols={len(schema_subset)}")
-                # To repair: generate only those missing columns for this row
-                # We'll call a repair function that returns a dict with missing cols only
-                repair = await self._repair_row(idx, missing_cols, schema_subset)
-                # Update the row
+                print(f"[Warning] [SchemaChunk {schema_chunk_idx}] Row {idx} missing columns {missing_cols}")
+                repair = await self._repair_row(idx, missing_cols, schema_subset, schema_chunk_idx)
                 row.update(repair)
 
         return collected
 
-    async def _repair_row(self, row_index, missing_cols, schema_subset):
-        """
-        Repair one row for missing columns: generate those missing cols values only for that row.
-        Returns a dict of missing_col_name -> generated string value.
-        """
+    async def _repair_row(self, row_index, missing_cols, schema_subset, schema_chunk_idx):
+        """Repair one row for missing columns; track which chunk, which row."""
         USER_MSG = (
             f"Generate values for these missing columns {missing_cols} for one row. "
             f"Schema: {schema_subset} (just generate the missing ones). "
@@ -151,60 +151,57 @@ class GenerateSyntheticData:
         try:
             obj = json.loads(content)
         except json.JSONDecodeError as e:
-            print(f"[Error] Repair parse error for row {row_index}, cols {missing_cols}: {e}")
+            print(f"[Error] [SchemaChunk {schema_chunk_idx}] Repair parse error for row {row_index}, cols {missing_cols}: {e}")
             obj = {}
 
-        # Ensure only missing_cols are present
         repair_dict = {}
         for col in missing_cols:
             val = obj.get(col)
             if val is None or not isinstance(val, str):
-                # If not returned properly, generate a simple fallback
-                val = ""  # or some default placeholder
+                # fallback if not provided correctly
+                val = ""  # or some placeholder, or regenerate again
             repair_dict[col] = val
 
-        print(f"[Repair] Fixed row {row_index} missing {missing_cols} in {elapsed:.2f}s")
+        print(f"[Repair] [SchemaChunk {schema_chunk_idx}] Row {row_index} missing {missing_cols} → repaired in {elapsed:.2f}s")
         return repair_dict
 
     async def generate_all(self, schema):
         """
-        Drive the full parallel process: multiple schema chunks in parallel,
-        each producing ALL rows for its column subset, then merge row-wise.
+        Parallel across column chunks and rows, with batch tracking of schema chunk index.
         """
         schema_chunks = list(self.chunk_schema(schema))
-        print(f"[Info] Total schema columns: {len(schema)}; broken into {len(schema_chunks)} chunks of up to {self.COLUMN_BATCH_SIZE} each.")
+        total_chunks = len(schema_chunks)
+        print(f"[Info] Total schema columns: {len(schema)}; broken into {total_chunks} chunks of up to {self.COLUMN_BATCH_SIZE} each.")
 
-        # Kick off parallel tasks for each schema chunk
-        chunk_tasks = [asyncio.create_task(self._generate_for_schema_chunk(chunk)) for chunk in schema_chunks]
+        # Kick off tasks for each schema chunk, with index
+        chunk_tasks = []
+        for schem_idx, chunk in enumerate(schema_chunks, start=1):
+            task = asyncio.create_task(self._generate_for_schema_chunk(chunk, schem_idx))
+            chunk_tasks.append((schem_idx, task))
 
         # Wait for all to finish
-        chunk_results = await asyncio.gather(*chunk_tasks)
+        # chunk_results_map maps schema_chunk_idx → result list of rows
+        chunk_results_map = {}
+        for schema_chunk_idx, task in chunk_tasks:
+            try:
+                result_rows = await task
+                chunk_results_map[schema_chunk_idx] = result_rows
+                print(f"[Info] [SchemaChunk {schema_chunk_idx}/{total_chunks}] Completed all {len(result_rows)} rows.")
+            except Exception as e:
+                print(f"[Error] [SchemaChunk {schema_chunk_idx}] Task raised exception: {e}")
+                # optionally retry, or set result to empty placeholders
+                chunk_results_map[schema_chunk_idx] = [{}] * self.TOTAL_RECORDS
 
         # Merge row-wise
         final = []
         for i in range(self.TOTAL_RECORDS):
             merged_row = {}
-            for chunk_idx, schema_chunk in enumerate(schema_chunks):
-                merged_row.update(chunk_results[chunk_idx][i])
+            for schem_idx in range(1, total_chunks + 1):
+                merged_row.update(chunk_results_map[schem_idx][i])
             final.append(merged_row)
 
         return final
 
-
-# Example of integrating with process_file
-
-def process_file(file_name, columns, TOTAL_RECORDS, connection_col_history):
-    """
-    Placeholder: your process_file should produce:
-      - column_details: list of column schema for that file
-      - possibly update connection_col_history (if you're tracking which columns connect across files)
-    Here we assume `columns` is already the schema list for this file,
-    so column_details = columns.
-    """
-    # If you have logic to filter or adjust columns, handle it here
-    column_details = columns
-    # Maybe update connection_col_history if needed
-    return None, column_details, connection_col_history
 
 
 async def main():
