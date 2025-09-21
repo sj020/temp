@@ -112,11 +112,38 @@ def replace_placeholder_in_presentation(input_path, output_path, placeholder, re
     prs.save(output_path)
     print(f"Saved replaced PPTX -> {output_path}")
 
-# Example usage:
+import os
+from pdf2image import convert_from_path, convert_from_bytes
+
+def pdf_to_images(pdf_path, output_folder, fmt='PNG', dpi=200, poppler_path=None):
+    """
+    Convert each page of pdf_path into an image in output_folder.
+
+    Arguments:
+        pdf_path (str): path to input PDF file.
+        output_folder (str): directory where page images will be saved.
+        fmt (str): image format, e.g. 'PNG', 'JPEG'.
+        dpi (int): resolution in DPI for rendering.
+        poppler_path (str or None): path to poppler bin dir on systems where required (Windows).
+    """
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    if poppler_path:
+        pages = convert_from_path(pdf_path, dpi=dpi, fmt=fmt, poppler_path=poppler_path)
+    else:
+        pages = convert_from_path(pdf_path, dpi=dpi, fmt=fmt)
+
+    for i, page in enumerate(pages, start=1):
+        fname = os.path.join(output_folder, f"page_{i}.{ fmt.lower() }")
+        page.save(fname, fmt)
+        print(f"Saved {fname}")
+
 if __name__ == "__main__":
-    replace_placeholder_in_presentation(
-        input_path="template.pptx",
-        output_path="output_replaced.pptx",
-        placeholder="<company>",
-        replacement="Acme Corporation"
-    )
+    pdf_file = "filled.pdf"         # your PDF file
+    out_dir = "pdf_pages_images"     # folder to store images
+    # If you're on Windows and have poppler not in PATH, set this
+    poppler_bin_path = None
+    # e.g. poppler_bin_path = r"C:\poppler-xx\bin"
+
+    pdf_to_images(pdf_file, out_dir, fmt='PNG', dpi=200, poppler_path=poppler_bin_path)
