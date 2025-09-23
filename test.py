@@ -1,28 +1,20 @@
 # pip install python-docx
 from docx import Document
-from docx.table import Table
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.shared import Pt
+from docx.enum.table import WD_BORDER
 
-def _set_cell_border(cell, **kwargs):
+def _add_borders(cell):
     """
-    Safe helper – creates <w:tcPr> if missing, then adds borders.
-    kwargs: top / bottom / start / end / insideH / insideV
-    each accepts dict like {"val": "single", "sz": "12", "color": "000000"}
+    Put a single ½-pt black border on all four edges of the cell.
+    Works with ANY python-docx version.
     """
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()          # ensures <w:tcPr> exists
-    tcBorders = tcPr.first_child_found_in("w:tcBorders")
-    if tcBorders is None:
-        tcBorders = OxmlElement("w:tcBorders")
-        tcPr.append(tcBorders)
+    for edge in (WD_BORDER.TOP, WD_BORDER.BOTTOM, WD_BORDER.LEFT, WD_BORDER.RIGHT):
+        border = cell.borders.__getattribute__(edge.lower())
+        border.style = WD_BORDER.SINGLE
+        border.width = Pt(0.5)
+        border.color.rgb = None          # None == automatic (black)
 
-    for edge, attrs in kwargs.items():
-        e = OxmlElement(f"w:{edge}")
-        for k, v in attrs.items():
-            e.set(qn(f"w:{k}"), str(v))
-        tcBorders.append(e)
-
+# ------------------------------------------------------------------
 def dict_rows_to_word_table(rows, columns, file_path,
                             heading_text="Table 1 – Summary",
                             header=True):
@@ -35,33 +27,25 @@ def dict_rows_to_word_table(rows, columns, file_path,
 
     table = doc.add_table(rows=0, cols=len(columns))
 
-    # header row
+    # header
     if header:
         hdr_cells = table.add_row().cells
         for j, col in enumerate(columns):
-            hdr_cells[j].text = col[0].upper() + col[1:]   # capitalise
-            _set_cell_border(hdr_cells[j],
-                             top={"val": "single", "sz": "12", "color": "000000"},
-                             bottom={"val": "single", "sz": "12", "color": "000000"},
-                             start={"val": "single", "sz": "12", "color": "000000"},
-                             end={"val": "single", "sz": "12", "color": "000000"})
+            hdr_cells[j].text = col[0].upper() + col[1:]
+            _add_borders(hdr_cells[j])
 
-    # data rows
+    # data
     for row in rows:
         cells = table.add_row().cells
         for j, col in enumerate(columns):
             cells[j].text = str(row.get(col, ""))
-            _set_cell_border(cells[j],
-                             top={"val": "single", "sz": "12", "color": "000000"},
-                             bottom={"val": "single", "sz": "12", "color": "000000"},
-                             start={"val": "single", "sz": "12", "color": "000000"},
-                             end={"val": "single", "sz": "12", "color": "000000"})
+            _add_borders(cells[j])
 
     doc.save(file_path)
     print(f"Word file saved to {file_path}")
 
 
-# ----------------------------------------------------------
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     data = [
         {"product": "Apples",  "price": 1.2, "stock": 100},
