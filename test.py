@@ -1,66 +1,99 @@
-# pip install python-docx
-from docx import Document
-from docx.shared import Pt
-from docx.oxml.shared import qn
-from docx.table import _Cell
+@app.post("/invoke")
+async def invoke_workflow(body: WorkflowRequest = Depends(), files: List[UploadFile]= File(default=None), source_files: List[UploadFile]= File(default=None)):
+    logger.info(f"Workflow invoked with stage: {body.stage}, thread_id: {body.thread_id}")
+    try:
+        if body.stage == "toc_generation":
+            if not source_files:
+                logger.error("Source Files Not Provided.")
+                raise HTTPException(400, "Source Files Not Provided.")
+            temp_uuid = uuid.uuid4()
+            body.thread_id = body.thread_id + "_" + str(temp_uuid)
+            config = {"configurable": {"thread_id": body.thread_id}}
+            if not body.human_input:
+                try:
+                    uploaded_files = []
+                    if body.file_mapping_data:
+                        uploaded_files = await ProcessingFiles().file_processer(files, ast.literal_eval(body.file_mapping_data))
+                    logger.info(f"Uploaded files processed: {len(uploaded_files)} files.")
 
-# ---------- border helper (works with every python-docx version) ----------
-def _set_cell_border(cell: _Cell, width=Pt(0.5), colour="000000"):
-    """
-    Add a simple single-line border to all four edges of *cell*.
-    """
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
+                    if source_files:
+                        # Upload all source files to ADLS and get the paths
+                        source_dir = f"Engagement/{body.company_name}/{body.engagement_id}/FBDI/Source/"
+                        upload_tasks = []
+                        for upload_file in source_files:
+                            file_bytes = await upload_file.read()
+                            upload_tasks.append(
+                                anyio.to_thread.run_sync(ADLSService().upload_file, source_dir + f"{upload_file.filename}", file_bytes)
+                            )
+                        uploaded_source_files = await asyncio.gather(*upload_tasks)
+                except Exception as e:
+                    logger.error(f"Error processing uploaded files: {e}")
+                    logger.error(f"File mapping data: {body.file_mapping_data}")
+                    logger.error(f"File mapping data type: {type(body.file_mapping_data)}")
+                    raise(e)
+                
+                for v in ast.literal_eval(body.target_file).values():
+                    sheet_details = v
+                if body.target_status == "Engagement":
+                    target_path = f"Engagement/{body.company_name}/{body.engagement_id}/FBDI/Target/{body.choosen_suite}/{body.choosen_product}/"
+                elif body.target_status == "Global":
+                    target_path = f"Global/{body.company_name}/{body.engagement_id}/FBDI/Target/{body.choosen_suite}/{body.choosen_product}/"
+                else:
+                    raise HTTPException(400, "Invalid target status. Must be 'Engagement' or 'Global'.")
+                
+                input_details = {
+                    "target_system" : body.choosen_platform,
+                    "cdd_doc_process": body.cdd_doc_process,
+                    "source_to_target_mapping": body.source_to_target_mapping,
+                    "uploaded_files": uploaded_files,
+                    "additional_notes": body.additional_notes,
+                    "source_dir":source_dir,
+                    "target_file_path":target_path,
+                    "sheet_details": sheet_details
+                }
 
-    # create <w:tcBorders> if it does not exist
-    tcBorders = tcPr.find(qn('w:tcBorders'))
-    if tcBorders is None:
-        tcBorders = tcPr._element._new_tcBorders()
+                initial = {"input_details": input_details, "toc": [], "sections": {}, "last_human_input": None}
+                logger.info("TOC generation workflow invoked.")
+                result = await app_graph.ainvoke(initial, config)
+                logger.info("TOC generation completed.")
+                next_tasks = await app_graph.aget_state(config)
+                logger.info(f"Next tasks available: {next_tasks.next}")
+                if next_tasks:
+                    logger.info(f"Workflow waiting for next tasks.")
+                    return {
+                        "status": "waiting",
+                        "next": next_tasks.next,
+                        "state": result,
+                        "thread_id": body.thread_id
+                    }      
+        elif body.stage in ["update_toc", "section_generation", "feedback_section", "doc_generation"]:
+            config = {"configurable": {"thread_id": body.thread_id}}
+            state_snapshot = await app_graph.aget_state(config)
+            if state_snapshot.next:
+                if not body.human_input:
+                    logger.error("Human input required when graph is paused.")
+                    raise HTTPException(status_code=400, detail= "Human Input required when graph is paused.")
+                
+                result = await app_graph.ainvoke(Command(resume=ast.literal_eval(body.human_input)), config=config)
+            state_snapshot = await app_graph.aget_state(config)
 
-    for edge in ('top', 'left', 'bottom', 'right'):
-        e = tcBorders.find(qn(f'w:{edge}'))
-        if e is None:
-            e = tcBorders._new_edge(f'w:{edge}')
-        e.set(qn('w:val'), 'single')
-        e.set(qn('w:sz'),  str(int(width)))   # width in eighths of a point
-        e.set(qn('w:color'), colour)
-
-# ------------------------------------------------------------------
-def dict_rows_to_word_table(rows, columns, file_path,
-                            heading_text="Table 1 – Summary",
-                            header=True):
-    if not rows:
-        print("No data supplied.")
-        return
-
-    doc = Document()
-    doc.add_heading(heading_text, level=2)
-
-    table = doc.add_table(rows=0, cols=len(columns))
-
-    # header row
-    if header:
-        hdr_cells = table.add_row().cells
-        for j, col in enumerate(columns):
-            hdr_cells[j].text = col[0].upper() + col[1:]
-            _set_cell_border(hdr_cells[j])
-
-    # data rows
-    for row in rows:
-        cells = table.add_row().cells
-        for j, col in enumerate(columns):
-            cells[j].text = str(row.get(col, ""))
-            _set_cell_border(cells[j])
-
-    doc.save(file_path)
-    print(f"Word file saved to {file_path}")
-
-# ------------------------------------------------------------------
-if __name__ == "__main__":
-    data = [
-        {"product": "Apples",  "price": 1.2, "stock": 100},
-        {"product": "Bananas", "price": 0.9, "stock": 150},
-        {"product": "Cherries","price": 2.5, "stock": 75}
-    ]
-    desired_cols = ["product", "price", "stock"]
-    dict_rows_to_word_table(data, desired_cols, "report.docx")
+            if state_snapshot.next:
+                logger.info(f"Workflow waiting for next tasks.")
+                return {
+                    "status": "waiting",
+                    "next": state_snapshot.next,
+                    "state": result,
+                    "thread_id": body.thread_id
+                }
+            else:
+                logger.info("Workflow completed. Returning generated document.")
+                return FileResponse(
+                    path="Temp.docx",
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+        else:
+            logger.error(f"Invalid stage provided: {body.stage}")
+            raise HTTPException(status_code=400, detail="Invalid stage provided.")
+    except Exception as e:
+        logger.error(f"Error occurred: {e}")
+        return JSONResponse(status_code=500, content={"message": "Internal Server Error"})
