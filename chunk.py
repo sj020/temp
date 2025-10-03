@@ -1,268 +1,189 @@
 import asyncio
 import json
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field, create_model
-from openai import AsyncOpenAI
+import os
+import time
+from typing import List, Dict, Any
+import copy
 
-# -----------------------------------------------------------
-# 1. Configuration and Constants
-# -----------------------------------------------------------
+# Make sure to pip install "openai>=1.0.0"
+from openai import AsyncAzureOpenAI
 
-# IMPORTANT: The AsyncOpenAI client automatically looks for the OPENAI_API_KEY 
-# environment variable. Ensure this is set in your terminal environment.
-client = AsyncOpenAI() 
+# --- Configuration ---
 
-# Overall goals
-NUM_RECORDS_TO_GENERATE = 50   # Total number of synthetic records desired
-RECORDS_PER_CALL = 10          # The number of records requested in the first pass of each chunk
+# Azure OpenAI credentials should be set as environment variables
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
-# Control limits
-CONCURRENCY_LIMIT = 5          # Limits the number of simultaneous API calls (for rate limiting)
-MAX_RETRIES = 3                # Maximum attempts to successfully generate a required chunk
+# Validate that all required environment variables are set
+if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT_NAME, AZURE_OPENAI_API_VERSION]):
+    raise ValueError("One or more required Azure OpenAI environment variables are not set.")
 
-# Define the size for splitting the schema into manageable groups
-SCHEMA_GROUP_SIZE = 7
+# NEW: Control how many columns are sent in a single prompt.
+SCHEMA_CHUNK_SIZE = 10 
 
-# Example of a large schema (expand this list with all your fields)
-# This list simulates the "huge" schema you mentioned.
-schema_list = [
+# Parameters for data generation
+TOTAL_RECORDS_TO_GENERATE = 100
+RECORDS_PER_API_CALL = 10
+MAX_CONCURRENT_REQUESTS = 5
+MAX_RETRIES_PER_BATCH = 3
+
+# Your input schema (can be much larger)
+HUGE_SCHEMA = [
     {"name": "Make", "data_type": "Text", "parameters": "Vehicle Manufacturer name", "sample_data": "Toyota"},
     {"name": "Model", "data_type": "Text", "parameters": "Vehicle Model name", "sample_data": "Camry"},
-    {"name": "Year", "data_type": "Number", "parameters": "Year of manufacture (between 2000 and 2024)", "sample_data": "2020"},
-    {"name": "Color", "data_type": "Text", "parameters": "Vehicle exterior color", "sample_data": "Red"},
-    {"name": "Price_USD", "data_type": "Number", "parameters": "Selling price in USD", "sample_data": "25000"},
-    {"name": "Mileage_mi", "data_type": "Number", "parameters": "Odometer reading in miles (0 to 150000)", "sample_data": "45000"},
-    {"name": "VIN_Last_4", "data_type": "Text", "parameters": "Last 4 characters of the VIN (unique for the batch)", "sample_data": "123A"},
-    {"name": "Transmission", "data_type": "Text", "parameters": "Transmission type (Automatic, Manual, CVT)", "sample_data": "Automatic"},
-    {"name": "Engine_Type", "data_type": "Text", "parameters": "Engine type (V6, I4, Electric)", "sample_data": "I4"},
-    {"name": "Drivetrain", "data_type": "Text", "parameters": "Drivetrain (AWD, FWD, RWD)", "sample_data": "FWD"},
-    {"name": "Seats_Material", "data_type": "Text", "parameters": "Interior seats material (Leather, Cloth, Vinyl)", "sample_data": "Cloth"},
-    {"name": "City_MPG", "data_type": "Number", "parameters": "City Miles Per Gallon rating (realistic for the vehicle)", "sample_data": "25"},
-    {"name": "Highway_MPG", "data_type": "Number", "parameters": "Highway Miles Per Gallon rating (realistic for the vehicle)", "sample_data": "35"},
-    {"name": "Has_Sunroof", "data_type": "Boolean", "parameters": "Does the vehicle have a sunroof (True/False)", "sample_data": "False"},
-    {"name": "Maintenance_Cost", "data_type": "Number", "parameters": "Average annual maintenance cost in USD", "sample_data": "500"},
-    {"name": "Fuel_Capacity_Gal", "data_type": "Number", "parameters": "Fuel tank capacity in gallons", "sample_data": "16"},
-    {"name": "Is_Clean_Title", "data_type": "Boolean", "parameters": "Has a clean title history (True/False)", "sample_data": "True"},
-    {"name": "Cylinders", "data_type": "Number", "parameters": "Number of engine cylinders (e.g., 4, 6, 8)", "sample_data": "4"},
+    {"name": "Year", "data_type": "Number", "parameters": "Vehicle's model year", "sample_data": 2023},
+    {"name": "Color", "data_type": "Text", "parameters": "Exterior color of the vehicle", "sample_data": "Blue"},
+    {"name": "Mileage", "data_type": "Number", "parameters": "Total miles driven, between 5000 and 150000", "sample_data": 45000},
+    {"name": "Price", "data_type": "Number", "parameters": "Sale price in USD, between 10000 and 50000", "sample_data": 25000},
+    {"name": "VIN", "data_type": "Text", "parameters": "A unique 17-character alphanumeric vehicle identification number", "sample_data": "1GKS29E18J921N4P7"},
+    {"name": "EngineType", "data_type": "Text", "parameters": "Type of engine, e.g., 'V6', '4-Cylinder', 'Electric'", "sample_data": "V6"},
+    {"name": "Transmission", "data_type": "Text", "parameters": "'Automatic' or 'Manual'", "sample_data": "Automatic"},
+    {"name": "OwnerCount", "data_type": "Number", "parameters": "Number of previous owners, from 1 to 5", "sample_data": 2},
+    # --- Chunk boundary would be here if SCHEMA_CHUNK_SIZE = 10 ---
+    {"name": "AccidentHistory", "data_type": "Boolean", "parameters": "True if the vehicle has been in an accident", "sample_data": False},
+    {"name": "FuelType", "data_type": "Text", "parameters": "'Gasoline', 'Diesel', 'Electric', 'Hybrid'", "sample_data": "Gasoline"},
 ]
 
-# -----------------------------------------------------------
-# 2. Schema Management
-# -----------------------------------------------------------
+# --- Core Logic ---
 
-def split_schema(schema: list, group_size: int) -> List[List[Dict[str, Any]]]:
-    """Splits the full schema list into smaller, manageable groups of columns."""
-    return [schema[i:i + group_size] for i in range(0, len(schema), group_size)]
-
-SCHEMA_GROUPS = split_schema(schema_list, group_size=SCHEMA_GROUP_SIZE)
-print(f"Schema split into {len(SCHEMA_GROUPS)} manageable groups of up to {SCHEMA_GROUP_SIZE} columns.")
-
-
-def get_pydantic_model(schema_group: List[Dict[str, Any]]):
-    """Dynamically creates a Pydantic model for a given column group."""
-    field_definitions = {}
-    for item in schema_group:
-        # Define all fields as strings to prevent LLM issues with strict type conversion (Number/Boolean)
-        # The prompt will guide the LLM to use the correct textual representation (e.g., "2024", "True")
-        field_definitions[item['name']] = (str, Field(description=item['parameters']))
-    
-    # Create the model for a single record chunk
-    SingleRecordChunk = create_model('SingleRecordChunk', **field_definitions)
-    
-    # Create the final list model (required for multiple records in one call)
-    class RecordList(BaseModel):
-        records: List[SingleRecordChunk]
-    
-    return RecordList
-
-# -----------------------------------------------------------
-# 3. LLM Interaction Prompt
-# -----------------------------------------------------------
-
-def create_prompt(schema_group: list, num_to_generate: int, existing_data: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Generates the prompt, including context from previous passes for coherence."""
-    schema_details = "\n".join([
-        f"- {item['name']}: {item['parameters']}. Sample: {item['sample_data']}"
-        for item in schema_group
-    ])
-    
-    prompt = f"Generate {num_to_generate} synthetic, diverse data records based ONLY on the following columns. Ensure the output is a valid JSON list conforming to the provided schema.\n"
-    prompt += f"COLUMN SCHEMA:\n{schema_details}\n"
-    
-    if existing_data:
-        # Pass the existing data as context to maintain consistency (e.g., price matches make/model)
-        prompt += "\n**IMPORTANT CONTEXT:** Here is the previously generated data for the primary columns. Ensure the new columns you generate are highly consistent and contextually relevant to the existing data in each corresponding record.\n"
-        
-        # Use a slice of the existing data to keep the context short
-        context_data = existing_data[:num_to_generate] 
-        prompt += f"EXISTING DATA CONTEXT (DO NOT REGENERATE THESE COLUMNS):\n{json.dumps(context_data, indent=2)}\n"
-        
-    return prompt
-
-# -----------------------------------------------------------
-# 4. Asynchronous Generation and Retry Logic
-# -----------------------------------------------------------
-
-semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-async def generate_chunk_pass(
-    schema_group: list, 
-    num_to_generate: int, 
-    existing_data: Optional[List[Dict[str, Any]]] = None,
-    retry_count: int = 0
-) -> List[Dict[str, Any]]:
-    """
-    Asynchronously calls the LLM to generate a chunk of records for a column group,
-    with retries to handle dropped records or missing columns (Pydantic errors).
-    """
-    if retry_count >= MAX_RETRIES:
-        col_names = [s['name'] for s in schema_group]
-        print(f"  ❌ Max retries reached ({MAX_RETRIES}) for columns: {col_names}. Returning empty list.")
+def chunk_schema(schema: List[Dict], chunk_size: int) -> List[List[Dict]]:
+    """Splits a large schema into a list of smaller schema chunks."""
+    if not schema:
         return []
+    return [schema[i:i + chunk_size] for i in range(0, len(schema), chunk_size)]
 
+def create_messages(schema: List[Dict], num_records: int, start_id: int) -> List[Dict]:
+    """Creates the messages payload for the Chat Completions API."""
+    schema_with_id = copy.deepcopy(schema)
+    schema_with_id.insert(0, {
+        "name": "record_id",
+        "data_type": "Number",
+        "parameters": f"A unique numeric ID for each record, starting from {start_id} and incrementing by 1.",
+        "sample_data": start_id
+    })
+    schema_str = json.dumps(schema_with_id, indent=2)
+
+    system_prompt = """
+    You are a high-quality synthetic data generation expert. Your task is to generate synthetic data records based on a provided schema.
+    **CRITICAL Instructions:**
+    1. Adhere strictly to the schema definition for each field.
+    2. Your output MUST be a single, valid JSON array of objects.
+    3. Do not include any text, explanations, or markdown formatting like ```json before or after the JSON array. Your response must be only the JSON.
+    """
+    
+    user_prompt = f"""
+    Please generate **exactly {num_records}** records based on the following schema.
+    The `record_id` for this batch MUST start at {start_id} and increment sequentially.
+
+    **Schema:**
+    {schema_str}
+    """
+    
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+async def generate_records_batch(
+    semaphore: asyncio.Semaphore,
+    client: AsyncAzureOpenAI,
+    deployment_name: str,
+    schema: List[Dict],
+    num_records: int,
+    start_id: int
+) -> List[Dict]:
+    """Generates a batch of records using Azure OpenAI, with a retry loop."""
     async with semaphore:
-        col_names = [s['name'] for s in schema_group]
-        print(f"  ➡️ Pass {retry_count+1}: Requesting {num_to_generate} records for {len(col_names)} columns...")
-        
-        SystemModel = get_pydantic_model(schema_group)
-        system_prompt = create_prompt(schema_group, num_to_generate, existing_data)
-        
-        try:
-            # Call the LLM with structured output enforcement
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Generate the data now."}
-                ],
-                response_model=SystemModel,
-                temperature=0.8
-            )
-            
-            # Convert Pydantic objects to dictionaries
-            generated_records = [record.model_dump() for record in response.records]
-            
-            # CRITICAL VALIDATION 1: Check if the LLM returned the correct number of records
-            if len(generated_records) != num_to_generate:
-                print(f"  ⚠️ Received {len(generated_records)}/{num_to_generate} records. Retrying due to record count mismatch...")
-                return await generate_chunk_pass(schema_group, num_to_generate, existing_data, retry_count + 1)
-            
-            # Since Pydantic enforcement handled the 'missing column' validation, 
-            # if we reach here, the JSON structure is correct and complete for this small pass.
-            print(f"  ✅ Pass successful. Generated {len(generated_records)} records for columns: {col_names}.")
-            return generated_records
-
-        except Exception as e:
-            # CRITICAL VALIDATION 2: Handles API errors, JSON parsing errors, and Pydantic validation errors 
-            # (which includes missing columns).
-            print(f"  ❌ Error occurred (likely Pydantic/missing column): {e}. Retrying...")
-            return await generate_chunk_pass(schema_group, num_to_generate, existing_data, retry_count + 1)
-
-
-async def generate_records_chunk_multiphase(total_records_in_chunk: int) -> List[Dict[str, Any]]:
-    """
-    Generates a full chunk of data (all columns) by making multiple sequential API calls
-    for each column group, ensuring column coherence.
-    """
-    
-    # 1. First Pass: Generate all records using the first, most essential column group
-    first_group = SCHEMA_GROUPS[0]
-    print(f"\n--- Starting Chunk Pass 1 for {total_records_in_chunk} records (Primary Columns: {[s['name'] for s in first_group]}) ---")
-    
-    current_data = await generate_chunk_pass(first_group, total_records_in_chunk)
-    if not current_data:
-        print("Initial data generation failed. Cannot proceed with chunk.")
-        return []
-        
-    # 2. Subsequent Passes: Iterate over the remaining column groups
-    for i, schema_group in enumerate(SCHEMA_GROUPS[1:]):
-        
-        print(f"\n--- Starting Chunk Pass {i+2} (Next Columns: {[s['name'] for s in schema_group]}) ---")
-
-        # Create a list of async tasks: one task to generate the new columns for each existing record.
-        # This keeps the total number of records consistent across passes.
-        tasks = []
-        for record_index, record_data in enumerate(current_data):
-            # We request 1 record at a time, providing the existing data for context.
-            tasks.append(
-                generate_chunk_pass(
-                    schema_group, 
-                    num_to_generate=1, 
-                    existing_data=[record_data] 
+        messages = create_messages(schema, num_records, start_id)
+        for attempt in range(MAX_RETRIES_PER_BATCH):
+            try:
+                print(f"-> Generating batch of {num_records} (ID: {start_id})... Attempt {attempt + 1}")
+                
+                response = await client.chat.completions.create(
+                    model=deployment_name,
+                    messages=messages,
+                    temperature=0.7, # A little creativity
                 )
-            )
+                
+                content = response.choices[0].message.content
+                cleaned_text = content.strip().replace("```json", "").replace("```", "").strip()
+                records = json.loads(cleaned_text)
+                
+                # ✅ VALIDATION STEP
+                if isinstance(records, list) and len(records) == num_records:
+                    print(f"<- Success: Generated and parsed {len(records)} records (ID: {start_id}).")
+                    return records
+                else:
+                    print(f"[WARNING] LLM returned {len(records)} records, expected {num_records}. Retrying...")
+            
+            except Exception as e:
+                print(f"[ERROR] Attempt {attempt + 1} failed for batch (ID: {start_id}): {e}. Retrying...")
+            
+            await asyncio.sleep(1) # Wait before retrying
 
-        # Run all tasks for this pass concurrently (using the semaphore for rate control)
-        results_list = await asyncio.gather(*tasks)
+        print(f"[FATAL] Batch failed after {MAX_RETRIES_PER_BATCH} attempts (ID: {start_id}). Skipping.")
+        return []
+
+async def main():
+    """Main function to orchestrate chunking, generation, and merging."""
+    # Initialize the AsyncAzureOpenAI client
+    client = AsyncAzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
+    
+    print("--- Starting Data Generation using Azure OpenAI ---")
+    start_time = time.time()
+    
+    schema_chunks = chunk_schema(HUGE_SCHEMA, SCHEMA_CHUNK_SIZE)
+    print(f"Schema has been split into {len(schema_chunks)} chunks of ~{SCHEMA_CHUNK_SIZE} columns each.")
+
+    final_records = {}
+    
+    for i, schema_chunk in enumerate(schema_chunks):
+        print(f"\n--- Processing Schema Chunk {i+1}/{len(schema_chunks)} ---")
         
-        # Merge the results back into the current_data list
-        for record_index, new_chunk_list in enumerate(results_list):
-            if new_chunk_list and len(new_chunk_list) == 1:
-                # Merge the dictionary of new columns into the existing record
-                current_data[record_index].update(new_chunk_list[0])
-            else:
-                print(f"  WARNING: Column generation failed and max retries exhausted for record {record_index}.")
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        tasks = []
         
-    # The current_data list now contains all records with all columns
-    return current_data
-
-# -----------------------------------------------------------
-# 5. Main Execution Function
-# -----------------------------------------------------------
-
-async def generate_large_data_set(
-    total_records: int, 
-    chunk_size: int
-) -> List[Dict[str, Any]]:
-    """
-    Manages the asynchronous generation of the entire dataset in concurrent chunks.
-    """
-    print(f"--- Starting total generation for {total_records} records ---")
+        for batch_start_index in range(0, TOTAL_RECORDS_TO_GENERATE, RECORDS_PER_API_CALL):
+            records_in_this_batch = min(RECORDS_PER_API_CALL, TOTAL_RECORDS_TO_GENERATE - batch_start_index)
+            if records_in_this_batch > 0:
+                task = asyncio.create_task(
+                    generate_records_batch(
+                        semaphore, client, AZURE_OPENAI_DEPLOYMENT_NAME, schema_chunk, records_in_this_batch, batch_start_index + 1
+                    )
+                )
+                tasks.append(task)
+        
+        results_from_batches = await asyncio.gather(*tasks)
+        
+        for batch in results_from_batches:
+            for record in batch:
+                record_id = record.pop('record_id', None)
+                if record_id is None:
+                    continue
+                if record_id not in final_records:
+                    final_records[record_id] = {}
+                final_records[record_id].update(record)
     
-    # Calculate the number of full chunks needed
-    num_chunks = (total_records + chunk_size - 1) // chunk_size
+    all_generated_records = [final_records[i] for i in sorted(final_records.keys())]
+    end_time = time.time()
     
-    # Create tasks for each full chunk (each task executes the multiphase generation)
-    tasks = []
-    for i in range(num_chunks):
-        current_chunk_size = min(chunk_size, total_records - i * chunk_size)
-        tasks.append(generate_records_chunk_multiphase(current_chunk_size))
+    print("\n--- ✅ Generation Complete ---")
+    print(f"Successfully generated {len(all_generated_records)} records.")
+    print(f"Total time taken: {end_time - start_time:.2f} seconds.")
     
-    # Run all full chunk generations concurrently
-    all_chunks_results = await asyncio.gather(*tasks)
-    
-    # Flatten and return the final list
-    final_records = [record for chunk in all_chunks_results for record in chunk]
-    
-    # Final check on column count for the first record
-    if final_records:
-        first_record_cols = len(final_records[0])
-        expected_cols = len(schema_list)
-        print(f"\n--- Final Verification ---")
-        print(f"Total columns expected: {expected_cols}")
-        print(f"Total columns found in first record: {first_record_cols}")
-    
-    print(f"--- Generation complete. Total records generated: {len(final_records)} ---")
-    return final_records
-
-# -----------------------------------------------------------
-# 6. Running the script
-# -----------------------------------------------------------
+    if all_generated_records:
+        print("\nSample of a final, merged record:")
+        print(json.dumps(all_generated_records[0], indent=2))
+            
+    with open("generated_data_azure.json", "w") as f:
+        json.dump(all_generated_records, f, indent=2)
+    print("\nFull dataset saved to 'generated_data_azure.json'")
 
 if __name__ == "__main__":
-    try:
-        generated_data = asyncio.run(
-            generate_large_data_set(
-                total_records=NUM_RECORDS_TO_GENERATE,
-                chunk_size=RECORDS_PER_CALL
-            )
-        )
-
-        print("\n--- Sample of Generated Record (First Record) ---")
-        if generated_data:
-            print(json.dumps(generated_data[0], indent=2))
-        else:
-            print("No data was generated due to errors.")
-            
-    except Exception as e:
-        print(f"\n[FATAL ERROR] An unexpected error occurred during execution: {e}")
+    asyncio.run(main())
