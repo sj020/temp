@@ -1,86 +1,78 @@
-from __future__ import annotations
-from dataclasses import dataclass
 from azure.storage.filedatalake import DataLakeServiceClient
 from azure.identity import DefaultAzureCredential
-import openpyxl
-from io import BytesIO
 
-# ------------------------------------------------------------------
-# dataclass that matches your specification
-# ------------------------------------------------------------------
-@dataclass
-class FileItem:
-    filename: str
-    location: str
-    sheet_list: list[str]
+def get_service_client(account_name: str):
+    account_url = f"https://{account_name}.dfs.core.windows.net"
+    credential = DefaultAzureCredential()
+    return DataLakeServiceClient(account_url, credential=credential)
 
-# ------------------------------------------------------------------
-# ADLS connection parameters
-# ------------------------------------------------------------------
-account_name   = "youradlsaccount"
-container_name = "your-container"
-root_path      = "cdd/Engagement/pepsico/101/FBDI/Sources"   # no leading /
-
-credentials = DefaultAzureCredential()
-service_cli = DataLakeServiceClient(
-        account_url=f"https://{account_name}.dfs.core.windows.net",
-        credential=credentials)
-fs_cli = service_cli.get_file_system_client(container_name)
-
-# ------------------------------------------------------------------
-# helpers
-# ------------------------------------------------------------------
-def abfss_path(item_name: str) -> str:
-    """Build abfss URI for an ADLS path."""
-    return f"abfss://{container_name}@{account_name}.dfs.core.windows.net/{item_name}"
-
-def sheet_names(file_client) -> list[str]:
-    """Return sheet names for an Excel file in ADLS (empty for non-Excel)."""
-    try:
-        stream = file_client.download_file(offset=0, length=256*1024)
-        wb = openpyxl.load_workbook(BytesIO(stream.readall()), read_only=True)
-        return wb.sheetnames
-    except Exception:
-        return []
-
-# ------------------------------------------------------------------
-# walk …/Source X/Source  and  …/Source X/Context
-# ------------------------------------------------------------------
-def collect(sub_folder: str) -> list[FileItem]:
+def list_files_in_dir(fs_client, directory_path: str):
     """
-    sub_folder = 'Source'  or  'Context'
-    returns list[FileItem]  (one sentinel FileItem(filename='None') if folder absent)
+    List **only** files immediately under directory_path (not deeper).
+    Returns a list of file names (strings). If no files, returns empty list.
     """
-    out: list[FileItem] = []
-    # grab Source 1, Source 2, … directories
-    src_dirs = [p for p in fs_cli.get_paths(path=root_path)
-                if p.is_directory and p.name.split("/")[-1].startswith("Source ")]
-    for src_dir in sorted(src_dirs, key=lambda d: d.name):
-        prefix = f"{src_dir.name}/{sub_folder}/"
-        hits   = [item for item in fs_cli.get_paths(path=prefix, recursive=True)
-                  if not item.is_directory]
-        if not hits:                       # folder missing or empty
-            out.append(FileItem(filename="None", location="", sheet_list=[]))
+    paths = fs_client.get_paths(path=directory_path)
+    files = []
+    prefix_len = len(directory_path.rstrip("/")) + 1  # for slicing
+    for p in paths:
+        # skip directories
+        if p.is_directory:
             continue
-        for item in hits:
-            file_cli = fs_cli.get_file_client(item.name)
-            name     = item.name.split("/")[-1]
-            location = abfss_path(item.name)
-            sheets   = sheet_names(file_cli)
-            out.append(FileItem(filename=name, location=location, sheet_list=sheets))
-    return out
+        # filter to only immediate children (no extra '/')
+        # p.name is the full path relative to root
+        sub = p.name[prefix_len:]
+        if "/" not in sub:
+            files.append(sub)
+    return files
 
-# ------------------------------------------------------------------
-# results
-# ------------------------------------------------------------------
-source_files: list[FileItem] = collect("Source")
-context_files: list[FileItem] = collect("Context")
+def get_source_context_listing(account_name: str, filesystem: str, root_path: str):
+    """
+    root_path = "cdd/Engagement/pepsico/101/FBDI/Sources"
+    """
+    svc = get_service_client(account_name)
+    fs_client = svc.get_file_system_client(filesystem)
 
-# quick sanity print
-print("SOURCE objects:")
-for it in source_files:
-    print(it)
+    # list all items under root_path (these should be “Source 1”, “Source 2”, etc.)
+    root_items = fs_client.get_paths(path=root_path)
+    # Filter to only subdirectories
+    source_dirs = [p.name for p in root_items if p.is_directory]
 
-print("\nCONTEXT objects:")
-for it in context_files:
-    print(it)
+    result = {}
+    for src in source_dirs:
+        # full paths
+        source_folder = f"{src}/Source"        # e.g. "…/Sources/Source 1/Source"
+        context_folder = f"{src}/Context"      # e.g. "…/Sources/Source 1/Context"
+
+        # Try listing files in source_folder
+        try:
+            files_src = list_files_in_dir(fs_client, source_folder)
+            if not files_src:
+                files_src = None
+        except Exception as e:
+            # e.g. directory does not exist
+            files_src = None
+
+        # Try listing files in context_folder
+        try:
+            files_ctx = list_files_in_dir(fs_client, context_folder)
+            if not files_ctx:
+                files_ctx = None
+        except Exception as e:
+            files_ctx = None
+
+        # store
+        result[src] = {
+            "Source": files_src,
+            "Context": files_ctx
+        }
+
+    return result
+
+# Usage example
+account = "yourADLSaccount"
+fs = "yourfilesystem"
+root = "cdd/Engagement/pepsico/101/FBDI/Sources"
+
+listing = get_source_context_listing(account, fs, root)
+for src, info in listing.items():
+    print(f"{src}: Source files = {info['Source']}, Context files = {info['Context']}")
