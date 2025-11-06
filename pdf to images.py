@@ -1,76 +1,104 @@
-#!/usr/bin/env python3
 import os
-import sys
-import shutil
-import tempfile
+import pypdf                 # Used for the (unreliable) text replacement
+import pypdfium2 as pdfium   # Used for the image rendering
 
-import pypdfium2 as pdfium
-from PIL import Image
+# --- Configuration ---
+INPUT_FILE = "input.pdf"       # Your source PDF
+TEMP_FILE = "temp_modified.pdf" # Intermediate file after text replacement
+SEARCH_TEXT = "<Company>"
+REPLACE_TEXT = "Pepsico"
+OUTPUT_PREFIX = "output_page"  # e.g., output_page_1.png
+IMAGE_FORMAT = "png"
+DPI_SCALE = 2  # Renders at 144 DPI (72 DPI * 2). Increase for higher quality.
+# ---
 
-def replace_text_simple(input_pdf_path: str, output_pdf_path: str,
-                        search_str: str, replace_str: str) -> None:
+def pypdf_replace_and_render():
     """
-    A *simple* attempt to replace all occurrences of search_str with replace_str in a PDF.
-    Note: May fail or produce incorrect layout depending on how text is stored in the PDF.
+    Attempts text replacement using pypdf and renders pages using PyPdfium2.
     """
-    from pypdfium2 import PdfDocument
     
-    doc = PdfDocument(input_pdf_path)
-    n_pages = len(doc)
-    for i in range(n_pages):
-        page = doc.get_page(i)
-        # Extract text (this may or may not reflect actual PDF layout)
-        text = page.get_textpage().get_text_range(0, page.get_textpage().get_text_length())
-        if search_str in text:
-            # This library does *not* directly support editing the existing text objects.
-            # Workaround: render the page to image, draw new text, and overlay (complex).
-            print(f"[WARN] Replacement on page {i} may not work as intended.")
-        page.close()
-    # For now we simply copy the file unchanged.
-    doc.close()
-    shutil.copyfile(input_pdf_path, output_pdf_path)
-    print(f"Copied input to output without actual replacement. Use a library supporting editing for real replacement.")
+    # Check if input file exists
+    if not os.path.exists(INPUT_FILE):
+        print(f"Error: Input file '{INPUT_FILE}' not found.")
+        return
 
-def pdf_to_images(input_pdf_path: str, output_folder: str, image_prefix: str = "page") -> None:
-    """
-    Render each page of the PDF to a PNG image.
-    """
-    pdf = pdfium.PdfDocument(input_pdf_path)
-    os.makedirs(output_folder, exist_ok=True)
-    for i in range(len(pdf)):
-        page = pdf[i]
-        pil_img = page.render_topil(
-            scale=2,            # increase scale for better resolution
-            rotation=0,
-            crop=(0, 0, 0, 0),
-            colour=(255, 255, 255, 255),
-            annotations=True,
-            greyscale=False,
-            optimise_mode=pdfium.OptimiseMode.NONE
-        )
-        img_path = os.path.join(output_folder, f"{image_prefix}_{i+1:03d}.png")
-        pil_img.save(img_path)
-        print(f"Saved {img_path}")
-        page.close()
-    pdf.close()
+    # === PART 1: Find & Replace Text (using pypdf) ===
+    print(f"Opening '{INPUT_FILE}' to replace text using pypdf...")
+    writer = pypdf.PdfWriter()
+    reader = None
+    found_count = 0
 
-def main():
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <input.pdf> <output_folder>")
-        sys.exit(1)
+    try:
+        reader = pypdf.PdfReader(INPUT_FILE)
+        
+        for page in reader.pages:
+            # Check if text exists on page before trying to replace
+            text = page.extract_text()
+            if text and SEARCH_TEXT in text:
+                found_count += text.count(SEARCH_TEXT)
+                # This is the pypdf replacement function.
+                # Its success depends heavily on the PDF's internal structure.
+                page.replace_text(SEARCH_TEXT, REPLACE_TEXT)
+            
+            writer.add_page(page)
 
-    input_pdf = sys.argv[1]
-    out_folder = sys.argv[2]
+        if found_count > 0:
+            print(f"pypdf found {found_count} potential instance(s) and attempted replacement.")
+        else:
+            print(f"Warning: pypdf's text extraction did not find '{SEARCH_TEXT}'.")
+            print("The text might still be visible, but not replaceable by this method.")
 
-    base_name = os.path.splitext(os.path.basename(input_pdf))[0]
-    replaced_pdf = os.path.join(out_folder, f"{base_name}_replaced.pdf")
+        print(f"Saving temporary file to '{TEMP_FILE}'...")
+        with open(TEMP_FILE, "wb") as f:
+            writer.write(f)
 
-    # Step 1: Replace text
-    replace_text_simple(input_pdf, replaced_pdf, "<Company>", "Pepsico")
+    except Exception as e:
+        print(f"Error during pypdf text replacement: {e}")
+        return
+    finally:
+        if reader:
+            reader.stream.close() # Good practice to close the file stream
+        writer.close()
 
-    # Step 2: Render to images
-    img_folder = os.path.join(out_folder, f"{base_name}_images")
-    pdf_to_images(replaced_pdf, img_folder, image_prefix=base_name)
+    # === PART 2: Render Images (using PyPdfium2) ===
+    print(f"\nOpening '{TEMP_FILE}' to render images using PyPdfium2...")
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(TEMP_FILE)
+        n_pages = len(pdf)
+        print(f"Found {n_pages} pages. Rendering...")
 
+        for i in range(n_pages):
+            page_number = i + 1
+            page = pdf.get_page(i)
+            
+            # Render the page to a bitmap
+            bitmap = page.render(scale=DPI_SCALE) 
+            
+            # Save the rendered image
+            output_filename = f"{OUTPUT_PREFIX}_{page_number}.{IMAGE_FORMAT}"
+            bitmap.save(output_filename)
+            
+            print(f"Saved {output_filename}")
+            
+            # Clean up page and bitmap objects
+            bitmap.close()
+            page.close()
+        
+        print(f"\nSuccessfully created {n_pages} images.")
+
+    except Exception as e:
+        print(f"Error during image rendering: {e}")
+        
+    finally:
+        if pdf:
+            pdf.close()
+        
+        # === PART 3: Cleanup ===
+        if os.path.exists(TEMP_FILE):
+            print(f"Cleaning up temporary file '{TEMP_FILE}'...")
+            os.remove(TEMP_FILE)
+
+# --- Main execution ---
 if __name__ == "__main__":
-    main()
+    pypdf_replace_and_render()
