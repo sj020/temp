@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""
+Replace every visible occurrence of the literal string '<Company>' with 'Pepsico'
+in a PDF using only *pypdfium2* (no PyMuPDF, no ReportLab).
+
+Usage:
+    python replace_with_pypdfium2.py input.pdf output.pdf
+"""
+import sys
+import pypdfium2 as pdfium
+from PIL import Image, ImageDraw, ImageFont
+
+SRC = "<Company>"
+DST = "Pepsico"
+
+def replace_company_pypdfium2(in_file: str, out_file: str, dpi: int = 150):
+    src_pdf = pdfium.PdfDocument(in_file)
+    dst_pdf = pdfium.PdfDocument.new()          # empty new document
+
+    # choose a PIL font that exists on most Linux systems
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                              size=int(dpi*0.18))
+
+    for page_index, page in enumerate(src_pdf):
+        # 1. render page → PIL image
+        bitmap = page.render(scale=dpi/72.0)
+        img = bitmap.to_pil()
+
+        # 2. locate every '<Company>' on the page  (PDF points)
+        textpage = page.get_textpage()
+        searcher = textpage.search(SRC, match_case=True, match_whole_word=False)
+        while True:
+            hit = searcher.get_next()
+            if hit is None:
+                break
+            start, count = hit
+            # get bounding box  (left, bottom, right, top) in PDF points
+            left, bottom, right, top = textpage.get_charbox(start, count=count)
+
+            # 3. convert PDF points → bitmap pixels
+            px_scale = dpi / 72.0
+            x1, y1, x2, y2 = [int(v*px_scale) for v in (left, top, right, bottom)]
+            # PIL uses top-left origin, PDF uses bottom-left → flip y
+            y1, y2 = img.height - y2, img.height - y1
+
+            # 4. white-out old text
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([x1, y1, x2, y2], fill="white")
+
+            # 5. centre new text in the same rectangle
+            tw, th = draw.textsize(DST, font=font)
+            draw.text((x1 + (x2-x1-tw)/2, y1 + (y2-y1-th)/2),
+                      DST, fill="black", font=font)
+
+        # 6. insert modified bitmap as a new page in destination PDF
+        w_px, h_px = img.size
+        w_pt, h_pt = w_px/px_scale, h_px/px_scale
+        new_page = dst_pdf.new_page(w_pt, h_pt)
+        pdf_img = pdfium.PdfImage.new(dst_pdf)
+        pdf_img.load_jpeg_bytes(io.BytesIO())      # dummy, we use set_bitmap
+        pdf_img.set_bitmap(img, pdfium_c.FPDFBitmap_BGRx)
+        pdf_img.set_matrix(pdfium.PdfMatrix().scale(w_pt, h_pt))
+        new_page.insert_obj(pdf_img)
+        new_page.gen_content()      # bake the bitmap into page content
+
+    dst_pdf.save(out_file, version=17)
+    print("Saved →", out_file)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit("usage: python replace_with_pypdfium2.py input.pdf output.pdf")
+    replace_company_pypdfium2(sys.argv[1], sys.argv[2])
