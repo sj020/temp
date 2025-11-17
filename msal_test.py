@@ -4,35 +4,29 @@ def get_token_device_code(client_id, tenant_id, scopes):
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     app = msal.PublicClientApplication(client_id, authority=authority)
 
-    # First try to get a token from cache (if user has already signed in before)
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(scopes, account=accounts[0])
-    else:
-        result = None
+    flow = app.initiate_device_flow(scopes=scopes)
+    if "user_code" not in flow:
+        print("Failed to start device flow:", flow)
+        return None
 
-    if not result:
-        # Initiate device code flow
-        flow = app.initiate_device_flow(scopes=scopes)
-        if "user_code" not in flow:
-            raise ValueError("Failed to create device flow. Error: %s" % flow)
-        print(flow["message"])  # Ask user to go to URL and enter code
-        result = app.acquire_token_by_device_flow(flow)  # This will block
+    print(flow["message"])
+    result = app.acquire_token_by_device_flow(flow)
+
+    # Debug: print full result
+    print("Result of acquire_token_by_device_flow:", result)
 
     if "access_token" in result:
         return result["access_token"]
     else:
-        print("Error acquiring token:")
-        print(result.get("error"))
-        print(result.get("error_description"))
-        print(result.get("correlation_id"))
+        print("Error:", result.get("error"))
+        print("Error description:", result.get("error_description"))
         return None
 
 if __name__ == "__main__":
-    CLIENT_ID = "your-client-id"
-    TENANT_ID = "your-tenant-id"
-    SCOPES = ["User.Read"]  # adjust scope as needed
+    CLIENT_ID = "your-client-id-here"
+    TENANT_ID = "your-tenant-id-here"
+    SCOPES = ["User.Read"]
 
     token = get_token_device_code(CLIENT_ID, TENANT_ID, SCOPES)
     if token:
-        print("Access token:", token)
+        print("Access Token:", token)
